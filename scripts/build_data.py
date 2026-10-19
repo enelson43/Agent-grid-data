@@ -26,7 +26,7 @@ MODE = sys.argv[2] if len(sys.argv) > 2 else "full"
 DO_OPTIONS = MODE in ("options", "full")
 DO_FULL = MODE == "full"
 NOW = dt.datetime.now(dt.timezone.utc)
-SEC_UA = "AgentGridData research bot (github.com/enelson43/agent-grid-data)"
+SEC_UA = "AgentGridData enelson43@users.noreply.github.com"
 RISK_FREE = 0.045  # flat rate used only for option deltas
 
 errors = {}

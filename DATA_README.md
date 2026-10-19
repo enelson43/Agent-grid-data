@@ -4,7 +4,7 @@ Rebuilt by the `market-data` GitHub Action. The `data` branch always holds a sin
 
 Read it from an agent session with:
 
-    git clone -q --depth 1 --branch data https://github.com/enelson43/agent-grid-data /tmp/agd
+    git clone -q --depth 1 --branch data https://github.com/enelson43/Agent-grid-data /tmp/agd
 
 Check `manifest.json` first: `generatedAt`, `lastBarDates`, `sectionsUpdatedAt` and `errors` tell you how fresh each part is.
 
