@@ -19,6 +19,6 @@ Check `manifest.json` first: `generatedAt`, `lastBarDates`, `sectionsUpdatedAt` 
 | `options/iv_history.csv` | Daily IV30 per ticker, used for IV rank | Daily |
 | `fundamentals/T.json` | Valuation and margin metrics, 8 quarters of revenue/EPS/FCF, balance sheet, earnings history and surprises, analyst targets and ratings, Yahoo insider transactions, top institutional holders | After the close |
 | `calendar/earnings.json` | Next earnings date per company (an estimate unless the company confirmed it) | After the close |
-| `sec/form4.json` | SEC Form 4 transactions from the last 45 days, parsed from EDGAR: owner, title, code (P = open-market buy), shares, price, value, 10b5-1 flag, filing URL | After the close |
+| `sec/form4.json` | SEC Form 4 transactions parsed from EDGAR (currently unavailable: the SEC blocks GitHub-hosted runners; use `insiderTransactionsYahoo` in `fundamentals/T.json`) | After the close |
 
 Prices come from Yahoo Finance via yfinance (Stooq as backup) and are delayed. Verify any price used for a trade decision.

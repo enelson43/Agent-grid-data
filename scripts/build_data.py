@@ -512,6 +512,10 @@ def sec_form4(days=45):
                       "sales": len([x for x in txs if x["code"] == "S"])}
             time.sleep(0.12)
         except Exception as e:
+            if "403" in str(e):
+                errors.setdefault("sec", {}).clear()
+                err("sec", "*", "SEC blocks requests from GitHub's servers; use insiderTransactionsYahoo in fundamentals/T.json")
+                return
             err("sec", t, e)
     write_json({"asOf": NOW.isoformat(), "windowDays": days,
                 "codes": {"P": "open-market purchase", "S": "open-market sale", "A": "grant/award", "M": "option exercise",
