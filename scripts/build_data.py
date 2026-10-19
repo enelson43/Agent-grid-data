@@ -438,6 +438,10 @@ def load_earnings():
 
 
 # --------------------------------------------------------------- SEC Form 4
+FALLBACK_CIK = {"AAPL": 320193, "MSFT": 789019, "NVDA": 1045810, "AMZN": 1018724, "GOOGL": 1652044, "META": 1326801,
+                "AVGO": 1730168, "AMD": 2488, "JPM": 19617, "LLY": 59478, "UNH": 731766, "XOM": 34088, "COST": 909832,
+                "CAT": 18230, "PLTR": 1321655, "GNRC": 1474735, "MU": 723125, "MRVL": 1835632, "ETN": 1551182,
+                "DE": 315189, "WFC": 72971, "JNJ": 200406, "VRT": 1674101, "NFLX": 1065280, "TSLA": 1318605}
 def sec_form4(days=45):
     s = requests.Session()
     s.headers.update({"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"})
@@ -446,8 +450,8 @@ def sec_form4(days=45):
         ct.raise_for_status()
         cik = {v["ticker"].upper(): int(v["cik_str"]) for v in ct.json().values()}
     except Exception as e:
-        err("sec", "*", f"company_tickers failed: {e}")
-        return
+        err("sec", "company_tickers", f"{e}; using built-in CIK list (verified against each filer's tickers)")
+        cik = dict(FALLBACK_CIK)
     cutoff = (NOW - dt.timedelta(days=days)).strftime("%Y-%m-%d")
     out = {}
     for t in TICKERS:
@@ -457,7 +461,11 @@ def sec_form4(days=45):
         try:
             sub = s.get(f"https://data.sec.gov/submissions/CIK{c:010d}.json", timeout=30)
             sub.raise_for_status()
-            rec = sub.json()["filings"]["recent"]
+            js = sub.json()
+            if t not in [x.upper() for x in js.get("tickers", [])]:
+                err("sec", t, f"CIK {c} belongs to {js.get('tickers')}, skipped")
+                continue
+            rec = js["filings"]["recent"]
             txs = []
             n = 0
             for form, acc, fdate, doc in zip(rec["form"], rec["accessionNumber"], rec["filingDate"], rec["primaryDocument"]):
