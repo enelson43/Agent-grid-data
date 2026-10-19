@@ -1,0 +1,72 @@
+name: market-data
+
+on:
+  schedule:
+    # Times are UTC. Hourly during the US session (covers both CDT and CST).
+    - cron: "20 13-21 * * 1-5"
+    # Full refresh after the close (5:40 PM CDT / 4:40 PM CST).
+    - cron: "40 22 * * 1-5"
+    # Sunday full refresh ahead of the Long-Term Position Builder.
+    - cron: "0 21 * * 0"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "light, options or full"
+        default: "full"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Pick mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ github.event.inputs.mode }}"
+          else
+            H=$(date -u +%H); DOW=$(date -u +%u)
+            if [ "$DOW" = "7" ] || [ "$H" = "22" ]; then MODE=full
+            elif [ "$H" = "15" ] || [ "$H" = "17" ] || [ "$H" = "19" ] || [ "$H" = "21" ]; then MODE=options
+            else MODE=light; fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Mode: $MODE"
+
+      - name: Restore the previous data pack
+        run: |
+          mkdir -p out
+          if git fetch --depth 1 origin data 2>/dev/null; then
+            git archive FETCH_HEAD | tar -x -C out
+          fi
+
+      - name: Build
+        run: python scripts/build_data.py out "${{ steps.mode.outputs.mode }}"
+
+      - name: Publish to the data branch
+        run: |
+          cp DATA_README.md out/README.md
+          cp watchlist.txt out/watchlist.txt
+          cd out
+          git init -q
+          git checkout -q -b data
+          git add -A
+          git -c user.name="agent-grid-data" -c user.email="actions@users.noreply.github.com" \
+            commit -qm "data $(date -u +%Y-%m-%dT%H:%MZ) ${{ steps.mode.outputs.mode }}"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" data
