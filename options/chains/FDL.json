@@ -1,0 +1,1 @@
+{"ticker":"FDL","spot":52.950001,"asOf":"2026-10-23T21:49:50.947378+00:00","chains":{"2026-11-20":[{"side":"P","strike":52.0,"bid":0.0,"ask":0.0,"last":2.3,"volume":null,"openInterest":1,"iv":0.015635,"delta":-0.0}],"2026-12-18":[{"side":"P","strike":49.0,"bid":0.0,"ask":3.6,"last":2.5,"volume":null,"openInterest":5,"iv":0.66724,"delta":-0.325011}]}}
