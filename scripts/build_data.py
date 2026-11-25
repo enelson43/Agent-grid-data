@@ -3,7 +3,11 @@
 Usage: python scripts/build_data.py OUT_DIR MODE
 MODE: light   - daily, weekly and hourly prices plus indicators
       options - light + option chains and volatility summary
-      full    - options + fundamentals, earnings calendar and SEC Form 4
+      full    - options + S&P 500 screener, fundamentals, earnings calendar and SEC Form 4
+Any run also refreshes a section that has gone stale (a missed scheduled run), whatever its mode.
+
+Coverage: the core watchlist (watchlist.txt), the sector ETFs (sector_etfs.csv) and the screener
+shortlist get full data. The rest of the S&P 500 is only screened.
 
 OUT_DIR may already hold the previous pack; files not rebuilt in this mode are kept.
 """
@@ -26,7 +30,7 @@ MODE = sys.argv[2] if len(sys.argv) > 2 else "full"
 DO_OPTIONS = MODE in ("options", "full")
 DO_FULL = MODE == "full"
 NOW = dt.datetime.now(dt.timezone.utc)
-SEC_UA = "AgentGridData enelson43@users.noreply.github.com"
+SEC_UA = "AgentGridData research script"
 RISK_FREE = 0.045  # flat rate used only for option deltas
 
 errors = {}
@@ -71,9 +75,34 @@ def read_tickers():
         return [l.strip().upper() for l in f if l.strip() and not l.startswith("#")]
 
 
-TICKERS = read_tickers()
-if "SPY" not in TICKERS:
-    TICKERS.insert(0, "SPY")
+CORE = read_tickers()
+if "SPY" not in CORE:
+    CORE.insert(0, "SPY")
+SECTORS = pd.read_csv("sector_etfs.csv").set_index("ticker")["name"].to_dict()
+TICKERS = list(CORE)  # replaced in main() by the full coverage list
+
+SHORTLIST_SIZE = 35      # top-ranked names
+SHORTLIST_MAX = 40       # plus up to 5 breakout / 40-week reclaim alerts
+MIN_PRICE = 10
+MIN_DOLLAR_VOL = 25e6    # 20-day average
+
+
+def load_prev_manifest():
+    p = os.path.join(OUT, "manifest.json")
+    if os.path.exists(p):
+        with open(p) as f:
+            return json.load(f)
+    return {}
+
+
+PREV = load_prev_manifest()
+
+
+def age_hours(section):
+    ts = PREV.get("sectionsUpdatedAt", {}).get(section)
+    if not ts:
+        return 1e9
+    return (NOW - dt.datetime.fromisoformat(ts)).total_seconds() / 3600
 
 
 # ---------------------------------------------------------------- prices
@@ -104,16 +133,46 @@ def stooq_daily(t):
     return df
 
 
+def naive(df):
+    if getattr(df.index, "tz", None) is not None:
+        df = df.copy()
+        df.index = df.index.tz_localize(None)
+    return df
+
+
+def download_daily(tickers, period, section, chunk=100, retry_limit=40):
+    """Batch download in chunks, then retry missing tickers one at a time."""
+    out = {}
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        try:
+            out.update(split_download(
+                yf.download(part, period=period, interval="1d", group_by="ticker", auto_adjust=False,
+                            threads=True, progress=False), part))
+        except Exception as e:
+            err(section, f"chunk {i // chunk + 1}", e)
+        if len(tickers) > chunk:
+            time.sleep(2)
+    missing = [t for t in tickers if t not in out]
+    for t in missing[:retry_limit]:
+        try:
+            h = yf.Ticker(t).history(period=period, interval="1d", auto_adjust=False)
+            if h is not None and not h.empty:
+                out[t] = naive(h)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return {t: naive(d) for t, d in out.items()}
+
+
 def get_prices():
-    daily = split_download(
-        yf.download(TICKERS, period="3y", interval="1d", group_by="ticker", auto_adjust=False,
-                    threads=True, progress=False), TICKERS)
+    daily = download_daily(TICKERS, "3y", "daily")
     for t in TICKERS:
         if t not in daily:
             try:
                 daily[t] = stooq_daily(t)
             except Exception as e:
-                err("daily", t, f"yfinance and stooq failed: {e}")
+                err("daily", t, f"yfinance (batch and single) and stooq failed: {e}")
     hourly = {}
     try:
         hourly = split_download(
@@ -522,10 +581,220 @@ def sec_form4(days=45):
                           "F": "tax withholding", "G": "gift"}, "tickers": out}, "sec", "form4.json")
 
 
+# --------------------------------------------------------------- screener
+UNIVERSE_URLS = [
+    "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+]
+WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+
+def load_universe():
+    cache = path("screener", "sp500_constituents.csv")
+    df = None
+    for u in UNIVERSE_URLS:
+        try:
+            df = pd.read_csv(u)
+            if len(df) < 450:
+                raise ValueError(f"only {len(df)} rows")
+            break
+        except Exception as e:
+            err("universe", u, e)
+            df = None
+    if df is None:
+        try:
+            html = requests.get(WIKI_URL, headers={"User-Agent": SEC_UA}, timeout=30).text
+            df = pd.read_html(html)[0]
+        except Exception as e:
+            err("universe", "wikipedia", e)
+    if df is None and os.path.exists(cache):
+        df = pd.read_csv(cache)
+        err("universe", "cache", "using the cached constituent list")
+    if df is None:
+        return pd.DataFrame(columns=["Symbol", "Security", "GICS Sector", "GICS Sub-Industry", "yf"])
+    for c in ("Security", "GICS Sector", "GICS Sub-Industry"):
+        if c not in df.columns:
+            df[c] = None
+    df["yf"] = df["Symbol"].astype(str).str.strip().str.replace(".", "-", regex=False)
+    df = df[["Symbol", "Security", "GICS Sector", "GICS Sub-Industry", "yf"]].drop_duplicates("yf")
+    df.to_csv(cache, index=False)
+    return df
+
+
+def accumulation_ratio(d, n=50):
+    x = d.iloc[-n:]
+    chg = x["Close"].diff()
+    up = x["Volume"][chg > 0].sum()
+    down = x["Volume"][chg < 0].sum()
+    return float(up / down) if down else None
+
+
+def run_screener():
+    uni = load_universe()
+    names = uni.set_index("yf").to_dict(orient="index")
+    tickers = list(dict.fromkeys(["SPY"] + list(uni["yf"]) + list(SECTORS)))
+    daily = download_daily(tickers, "2y", "screenDaily", chunk=100, retry_limit=40)
+    ind = indicators(daily)  # ranks relative strength across the whole universe
+    rows = []
+    for t, r in ind.items():
+        d = daily[t]
+        try:
+            dollar_vol = float((d["Close"] * d["Volume"]).iloc[-21:-1].mean())
+        except Exception:
+            dollar_vol = None
+        wc = to_weekly(d)["Close"]
+        sma40 = wc.rolling(40).mean()
+        reclaim40w = bool(len(wc) > 41 and wc.iloc[-1] > sma40.iloc[-1] and wc.iloc[-2] <= sma40.iloc[-2])
+        acc = accumulation_ratio(d) if "Volume" in d else None
+        rows.append({"ticker": t, **{k: r.get(k) for k in (
+            "lastBarDate", "close", "sma50", "sma200", "sma10w", "sma40w", "sma40wRising", "sma50Rising", "rsi14",
+            "macdHist", "atr14", "volRatio", "ret1m", "ret3m", "ret6m", "ret12m", "rs3m", "rs6m", "rs6mRankPct",
+            "high50d", "pctFrom52wHigh", "hv20")},
+            "avgDollarVol20": dollar_vol, "accumulation50d": acc, "reclaim40w": reclaim40w})
+    df = pd.DataFrame(rows).set_index("ticker")
+    df["rs3mRankPct"] = df["ret3m"].rank(pct=True) * 100
+
+    def score(r):
+        trend = int(bool(r.sma40w and r.close > r.sma40w and r.sma40wRising)) + int((r.rs6mRankPct or 0) >= 66.7)
+        breakout = bool(r.high50d and r.close > r.high50d and (r.volRatio or 0) >= 1.5)
+        pullback = bool(r.sma50Rising and r.atr14 and r.sma50 and 0 <= (r.close - r.sma50) <= 1.5 * r.atr14) or \
+            bool(r.sma10w and r.atr14 and 0 <= (r.close - r.sma10w) <= 1.0 * r.atr14 and r.close > r.sma40w)
+        setup = int(breakout or pullback)
+        momentum = int(50 <= (r.rsi14 or 0) <= 70 and (r.macdHist or 0) > 0)
+        accum = int((r.accumulation50d or 0) >= 1.2)
+        rs3 = int((r.rs3mRankPct or 0) >= 80)
+        flags = [f for f, on in (("breakout", breakout), ("pullback", pullback), ("reclaim40w", r.reclaim40w)) if on]
+        return pd.Series({"screenScore": trend + setup + momentum + accum + rs3, "trend": trend, "setup": setup,
+                          "momentum": momentum, "accumulation": accum, "rs3mTop": rs3, "flags": ",".join(flags)})
+
+    df = df.join(df.apply(score, axis=1))
+    df["liquid"] = (df["close"] >= MIN_PRICE) & (df["avgDollarVol20"].fillna(0) >= MIN_DOLLAR_VOL)
+    for col, key in (("name", "Security"), ("sector", "GICS Sector"), ("subIndustry", "GICS Sub-Industry")):
+        df[col] = [names.get(t, {}).get(key) if t in names else (SECTORS.get(t) if col == "name" else None) for t in df.index]
+    df.round(4).to_csv(path("screener", "universe_scores.csv"))
+
+    # shortlist with continuity: members stay while they still score 3+
+    prev_path = path("screener", "shortlist.json")
+    prev = {}
+    if os.path.exists(prev_path):
+        with open(prev_path) as f:
+            prev = {x["ticker"]: x for x in json.load(f).get("shortlist", [])}
+    excluded = set(CORE) | set(SECTORS)
+    pool = df[df["liquid"] & ~df.index.isin(excluded) & df.index.isin(list(uni["yf"]))]
+    pool = pool.sort_values(["screenScore", "rs6mRankPct"], ascending=False)
+    keep = [t for t in prev if t in pool.index and pool.loc[t, "screenScore"] >= 3]
+    new = [t for t in pool[pool["screenScore"] >= 4].index if t not in keep]
+    chosen = (keep + new)[:SHORTLIST_SIZE] if len(keep) < SHORTLIST_SIZE else \
+        sorted(keep, key=lambda t: (-pool.loc[t, "screenScore"], -(pool.loc[t, "rs6mRankPct"] or 0)))[:SHORTLIST_SIZE]
+    alerts = [t for t in pool.index if t not in chosen and pool.loc[t, "screenScore"] >= 3
+              and any(f in (pool.loc[t, "flags"] or "") for f in ("breakout", "reclaim40w"))]
+    chosen += alerts[:SHORTLIST_MAX - len(chosen)]
+    today = NOW.strftime("%Y-%m-%d")
+    items = []
+    for t in chosen:
+        r = pool.loc[t]
+        reasons = []
+        if r.trend >= 1:
+            reasons.append(f"weekly close {r.close:.2f} vs 40-week avg {r.sma40w:.2f}" + (" (rising)" if r.sma40wRising else ""))
+        reasons.append(f"6-month strength rank {r.rs6mRankPct:.0f}/100 in the S&P 500")
+        if "breakout" in (r["flags"] or ""):
+            reasons.append(f"closed above its 50-day high {r.high50d:.2f} on {r.volRatio:.1f}x volume")
+        if "pullback" in (r["flags"] or ""):
+            reasons.append(f"pulled back near support (50-day avg {r.sma50:.2f}, ATR {r.atr14:.2f})")
+        if "reclaim40w" in (r["flags"] or ""):
+            reasons.append("reclaimed its 40-week average this week")
+        if r.accumulation:
+            reasons.append(f"up-day volume {r.accumulation50d:.2f}x down-day volume over 50 days")
+        items.append({
+            "ticker": t, "name": r["name"], "sector": r["sector"], "subIndustry": r["subIndustry"],
+            "screenScore": int(r.screenScore), "breakdown": {k: int(r[k]) for k in ("trend", "setup", "momentum", "accumulation", "rs3mTop")},
+            "flags": [f for f in (r["flags"] or "").split(",") if f], "reasons": reasons,
+            "close": r.close, "sma50": r.sma50, "sma40w": r.sma40w, "atr14": r.atr14, "rsi14": r.rsi14,
+            "rs6mRankPct": r.rs6mRankPct, "ret3m": r.ret3m, "ret6m": r.ret6m, "pctFrom52wHigh": r.pctFrom52wHigh,
+            "avgDollarVol20": r.avgDollarVol20, "lastBarDate": r.lastBarDate,
+            "addedOn": prev.get(t, {}).get("addedOn", today), "alert": t in alerts,
+        })
+    dropped = [t for t in prev if t not in chosen]
+    write_json({"asOf": NOW.isoformat(), "universe": "S&P 500", "universeSize": int(len(uni)),
+                "screened": int(len(df)), "liquidPassed": int(len(pool)),
+                "rules": {"minPrice": MIN_PRICE, "minAvgDollarVolume20d": MIN_DOLLAR_VOL,
+                          "score": "0-6: trend 0-2 (weekly close above a rising 40-week avg; 6-month strength top third), setup 0-1 (50-day-high breakout on 1.5x volume, or pullback within 1.5 ATR of a rising 50-day avg or 1 ATR of the 10-week avg), momentum 0-1 (RSI 50-70 and MACD histogram > 0), accumulation 0-1 (50-day up/down volume >= 1.2), rs3mTop 0-1 (3-month return in the top 20%)",
+                          "membership": f"top {SHORTLIST_SIZE} new names score 4+; current members stay while they score 3+; up to {SHORTLIST_MAX - SHORTLIST_SIZE} breakout or 40-week reclaim alerts at 3+; core watchlist and sector ETFs excluded (always covered)"},
+                "shortlist": items, "droppedToday": dropped}, "screener", "shortlist.json")
+
+    # sector view: breadth by GICS sector and sector ETF leadership
+    breadth = {}
+    members = df[df.index.isin(list(uni["yf"]))]
+    for sec, g in members.groupby("sector"):
+        if not sec:
+            continue
+        breadth[sec] = {"count": int(len(g)),
+                        "pctAbove50d": float((g["close"] > g["sma50"]).mean() * 100),
+                        "pctAbove200d": float((g["close"] > g["sma200"]).mean() * 100),
+                        "pctAbove40w": float((g["close"] > g["sma40w"]).mean() * 100),
+                        "medianRet3m": float(g["ret3m"].median()), "medianRs6mRank": float(g["rs6mRankPct"].median()),
+                        "avgScreenScore": float(g["screenScore"].mean())}
+    etfs = []
+    for t, nm in SECTORS.items():
+        if t in df.index:
+            r = df.loc[t]
+            etfs.append({"ticker": t, "name": nm, "close": r.close, "ret1m": r.ret1m, "ret3m": r.ret3m, "ret6m": r.ret6m,
+                         "rs3m": r.rs3m, "rs6m": r.rs6m, "above40w": bool(r.sma40w and r.close > r.sma40w),
+                         "sma40wRising": r.sma40wRising, "screenScore": int(r.screenScore)})
+        else:
+            err("sectors", t, "no data")
+    etfs.sort(key=lambda x: -(x["rs3m"] if x["rs3m"] is not None else -999))
+    for i, e in enumerate(etfs):
+        e["rs3mRank"] = i + 1
+    all_m = members
+    write_json({"asOf": NOW.isoformat(),
+                "market": {"pctAbove50d": float((all_m["close"] > all_m["sma50"]).mean() * 100),
+                           "pctAbove200d": float((all_m["close"] > all_m["sma200"]).mean() * 100),
+                           "pctAbove40w": float((all_m["close"] > all_m["sma40w"]).mean() * 100),
+                           "newHighs": int((all_m["pctFrom52wHigh"] >= -1).sum())},
+                "gicsBreadth": breadth, "sectorEtfs": etfs}, "screener", "sectors.json")
+    ranks = df["rs6mRankPct"].to_dict()
+    return [x["ticker"] for x in items], ranks, len(uni), len([t for t in uni["yf"] if t in daily])
+
+
+def load_shortlist():
+    p = path("screener", "shortlist.json")
+    if os.path.exists(p):
+        with open(p) as f:
+            return [x["ticker"] for x in json.load(f).get("shortlist", [])]
+    return []
+
+
+def add_earnings_to_shortlist(earnings):
+    p = path("screener", "shortlist.json")
+    if not os.path.exists(p):
+        return
+    with open(p) as f:
+        sl = json.load(f)
+    for x in sl.get("shortlist", []):
+        x["nextEarnings"] = (earnings.get(x["ticker"]) or {}).get("next")
+    write_json(sl, "screener", "shortlist.json")
+
+
 # ------------------------------------------------------------------- main
 def main():
+    global TICKERS
     started = time.time()
     sections = {}
+    do_screen = DO_FULL or age_hours("screener") > 20 or not os.path.exists(path("screener", "shortlist.json"))
+    do_full = DO_FULL or age_hours("fundamentals") > 26
+    do_options = DO_OPTIONS or do_full or age_hours("options") > 6
+    universe_ranks, uni_size, uni_with_data = {}, None, None
+    if do_screen:
+        try:
+            shortlist, universe_ranks, uni_size, uni_with_data = run_screener()
+            sections["screener"] = NOW.isoformat()
+        except Exception:
+            err("screener", "*", traceback.format_exc()[-1200:])
+            shortlist = load_shortlist()
+    else:
+        shortlist = load_shortlist()
+    TICKERS = list(dict.fromkeys(CORE + list(SECTORS) + shortlist))
+    groups = {t: ("core" if t in CORE else "sector" if t in SECTORS else "shortlist") for t in TICKERS}
     daily, hourly = get_prices()
     for t, d in daily.items():
         save_bars(d, "daily", t)
@@ -533,12 +802,31 @@ def main():
     for t, h in hourly.items():
         save_bars(h, "hourly", t)
     ind = indicators(daily)
-    write_json({"asOf": NOW.isoformat(), "spyClose": ind.get("SPY", {}).get("close"), "tickers": ind}, "indicators", "latest.json")
+    if not universe_ranks:
+        try:
+            sc = pd.read_csv(path("screener", "universe_scores.csv"), index_col=0)
+            universe_ranks = sc["rs6mRankPct"].to_dict()
+        except Exception:
+            universe_ranks = {}
+    for t, r in ind.items():
+        r["group"] = groups.get(t)
+        if SECTORS.get(t):
+            r["sectorName"] = SECTORS[t]
+        u = universe_ranks.get(t)
+        if u is not None and not (isinstance(u, float) and math.isnan(u)):
+            r["rs6mRankWatchlist"] = r.get("rs6mRankPct")
+            r["rs6mRankPct"] = float(u)  # rank within the S&P 500 (100 = strongest)
+            above = r.get("sma40w") and r["weeklyClose"] > r["sma40w"] and r.get("sma40wRising")
+            r["trendScoreHint"] = int(bool(above)) + int(r["rs6mRankPct"] >= 66.7)
+    write_json({"asOf": NOW.isoformat(), "spyClose": ind.get("SPY", {}).get("close"),
+                "rs6mRankBasis": "S&P 500 universe where screened, otherwise this file's tickers",
+                "tickers": ind}, "indicators", "latest.json")
     sections["prices"] = NOW.isoformat()
     earnings = load_earnings()
-    if DO_FULL:
+    if do_full:
         try:
             earnings = fundamentals()
+            add_earnings_to_shortlist(earnings)
             sections["fundamentals"] = NOW.isoformat()
         except Exception:
             err("fundamentals", "*", traceback.format_exc())
@@ -547,7 +835,7 @@ def main():
             sections["sec"] = NOW.isoformat()
         except Exception:
             err("sec", "*", traceback.format_exc())
-    if DO_OPTIONS:
+    if do_options:
         try:
             options(ind, earnings)
             sections["options"] = NOW.isoformat()
@@ -559,15 +847,43 @@ def main():
         with open(mp) as f:
             prev = json.load(f)
     updated = {**prev.get("sectionsUpdatedAt", {}), **sections}
+    # data health: flags the kind of throttling or outage that would call for a paid feed
+    issues = []
+    n_cov = len(TICKERS)
+    miss_cov = sorted(set(TICKERS) - set(daily))
+    if len(miss_cov) > max(2, 0.03 * n_cov):
+        issues.append(f"{len(miss_cov)} of {n_cov} covered tickers have no daily prices")
+    if uni_size:
+        miss_pct = 100 * (1 - (uni_with_data or 0) / uni_size)
+        if miss_pct > 5:
+            issues.append(f"{miss_pct:.0f}% of the S&P 500 had no data in the screen")
+    if do_screen and "screener" not in sections:
+        issues.append("the S&P 500 screen failed; agents are using the previous shortlist")
+    if len(set(TICKERS) - set(hourly)) > 0.1 * n_cov:
+        issues.append(f"hourly bars missing for {len(set(TICKERS) - set(hourly))} of {n_cov} tickers")
+    if do_options and len(errors.get("options", {})) > 0.1 * n_cov + 2:
+        issues.append(f"options failed for {len(errors['options'])} of {n_cov} tickers")
+    if do_full and len(errors.get("fundamentals", {})) > 0.1 * n_cov:
+        issues.append(f"fundamentals failed for {len(errors['fundamentals'])} of {n_cov} tickers")
+    for sec_name, hrs in (("options", 30), ("fundamentals", 54), ("screener", 54)):
+        ts = updated.get(sec_name)
+        if ts and (NOW - dt.datetime.fromisoformat(ts)).total_seconds() / 3600 > hrs:
+            issues.append(f"{sec_name} data is more than {hrs} hours old")
     write_json({
         "generatedAt": NOW.isoformat(), "mode": MODE, "runSeconds": round(time.time() - started),
+        "ranSections": sorted(sections),
+        "dataHealth": {"status": "degraded" if issues else "ok", "issues": issues},
+        "coverage": {"core": len(CORE), "sectorEtfs": len(SECTORS), "shortlist": len(shortlist), "total": n_cov},
+        "groups": groups,
         "tickers": TICKERS,
         "tickersWithDaily": sorted(daily), "tickersMissingDaily": sorted(set(TICKERS) - set(daily)),
         "lastBarDates": {t: r["lastBarDate"] for t, r in ind.items()},
         "sectionsUpdatedAt": updated,
         "errors": errors,
     }, "manifest.json")
-    print(json.dumps({"mode": MODE, "daily": len(daily), "hourly": len(hourly), "errors": {k: len(v) for k, v in errors.items()}}))
+    print(json.dumps({"mode": MODE, "sections": sorted(sections), "covered": n_cov, "daily": len(daily),
+                      "hourly": len(hourly), "shortlist": len(shortlist), "health": issues,
+                      "errors": {k: len(v) for k, v in errors.items()}}))
 
 
 if __name__ == "__main__":
